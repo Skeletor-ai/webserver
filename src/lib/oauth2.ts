@@ -293,7 +293,7 @@ export function createOAuth2Server(
         const webauthnOptions: WebAuthnOptions = {
             rpId: options.rpId,
             rpName: options.rpName || 'ioBroker',
-            expectedOrigins: options.expectedOrigins || [],
+            expectedOrigins: options.expectedOrigins || [],  // empty = auto-detect from request in webauthn.ts
         };
         setupWebAuthnRoutes(options.app, adapter, model, webauthnOptions);
     }
@@ -317,7 +317,8 @@ export function createOAuth2Server(
                                 void adapter.destroySession(`r:${token.refreshToken}`);
                             }
 
-                            const challenge = await generate2FAChallenge(adapter, token.user.id, options.rpId);
+                            const effectiveRpId = req.hostname || req.headers.host?.split(':')[0] || options.rpId;
+                            const challenge = await generate2FAChallenge(adapter, token.user.id, effectiveRpId);
                             if (challenge) {
                                 res.json({
                                     requires2FA: true,

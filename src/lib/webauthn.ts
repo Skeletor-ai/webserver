@@ -45,21 +45,68 @@ interface ChallengeSession {
 const CHALLENGE_TTL = 300; // 5 minutes
 
 /**
- * Get the authenticated user from the request (set by authorize middleware or cookie)
+ * Get the authenticated user from the request.
+ * Checks req.user first (set by authorize middleware), then falls back to
+ * extracting the user from the access_token cookie or Authorization header
+ * via the OAuth2 model. This is needed because /login/ paths bypass the
+ * authorize middleware in the admin adapter.
  */
-function getAuthenticatedUser(req: Request): string | undefined {
-    return (req as Request & { user?: string }).user;
+async function getAuthenticatedUser(req: Request, model?: OAuth2Model): Promise<string | undefined> {
+    console.log(`[WEBAUTHN-DEBUG] getAuthenticatedUser called, hasModel=${!!model}, reqUser=${(req as any).user}`);
+
+    const _req = req as Request & { user?: string };
+    if (_req.user) {
+        return _req.user;
+    }
+
+    if (!model) {
+        return undefined;
+    }
+
+    // Try access_token cookie
+    if (req.headers.cookie) {
+        const cookies = req.headers.cookie.split(';').map(c => c.trim().split('='));
+        const tokenCookie = cookies.find(c => c[0] === 'access_token');
+        if (tokenCookie?.[1]) {
+            const token = await model.getAccessToken(tokenCookie[1]);
+            if (token) {
+                return token.user.id;
+            }
+        }
+    }
+
+    // Try Authorization: Bearer header
+    if (req.headers.authorization?.startsWith('Bearer ')) {
+        const token = await model.getAccessToken(req.headers.authorization.substring(7));
+        if (token) {
+            return token.user.id;
+        }
+    }
+
+    return undefined;
 }
 
 /**
  * Get user's WebAuthn credentials from the database
  */
+// In-memory credential cache to protect against Admin UI overwrites
+const credentialCache = new Map<string, StoredCredential[]>();
+
 async function getUserCredentials(adapter: ioBroker.Adapter, userId: string): Promise<StoredCredential[]> {
-    const obj = await adapter.getForeignObjectAsync(`system.user.${userId}`);
-    if (!obj?.native?.webauthn) {
-        return [];
+    // Check cache first (authoritative source)
+    const cached = credentialCache.get(userId);
+    if (cached) {
+        console.log(`[WEBAUTHN-DEBUG] getUserCredentials: userId=${userId}, count=${cached.length} (cache)`);
+        return cached;
     }
-    return obj.native.webauthn as StoredCredential[];
+    // Load from user object (initial load / restart)
+    const obj = await adapter.getForeignObjectAsync(`system.user.${userId}`);
+    const creds = (obj?.native?.webauthn as StoredCredential[]) || [];
+    console.log(`[WEBAUTHN-DEBUG] getUserCredentials: userId=${userId}, count=${creds.length} (db)`);
+    if (creds.length > 0) {
+        credentialCache.set(userId, creds);
+    }
+    return creds;
 }
 
 /**
@@ -70,9 +117,18 @@ async function saveUserCredentials(
     userId: string,
     credentials: StoredCredential[],
 ): Promise<void> {
-    await adapter.extendForeignObjectAsync(`system.user.${userId}`, {
-        native: { webauthn: credentials },
-    });
+    console.log(`[WEBAUTHN-DEBUG] saveUserCredentials: userId=${userId}, count=${credentials.length}`);
+    // Update cache first (protects against immediate overwrites)
+    credentialCache.set(userId, credentials);
+    try {
+        await adapter.extendForeignObjectAsync(`system.user.${userId}`, {
+            native: { webauthn: credentials },
+        });
+        console.log(`[WEBAUTHN-DEBUG] saveUserCredentials: OK`);
+    } catch (e: any) {
+        console.log(`[WEBAUTHN-DEBUG] saveUserCredentials: FAILED: ${e.message}`);
+        throw e;
+    }
 }
 
 /**
@@ -124,14 +180,77 @@ export function setupWebAuthnRoutes(
     model: OAuth2Model,
     options: WebAuthnOptions,
 ): void {
-    const { rpId, rpName, expectedOrigins } = options;
+    const { rpId: configuredRpId, rpName, expectedOrigins } = options;
+
+    /** Get the effective rpId - derive from request Host header for maximum compatibility */
+    function getRpId(req?: Request): string {
+        if (req) {
+            const host = req.hostname || req.headers.host?.split(':')[0];
+            if (host && host !== '127.0.0.1') {
+                return host;
+            }
+        }
+        return configuredRpId || 'localhost';
+    }
+
+    // Subscribe to user object changes and restore credentials if overwritten
+    void adapter.subscribeForeignObjectsAsync('system.user.*');
+    adapter.on('objectChange', (id: string, obj: ioBroker.Object | null | undefined) => {
+        if (!id.startsWith('system.user.') || !obj) {
+            return;
+        }
+        const userId = id.replace('system.user.', '');
+        const cached = credentialCache.get(userId);
+        if (!cached || cached.length === 0) {
+            return;
+        }
+        const current = (obj.native?.webauthn as StoredCredential[]) || [];
+        if (current.length === 0) {
+            console.log(`[WEBAUTHN-DEBUG] objectChange: ${id} lost credentials, restoring ${cached.length} from cache`);
+            void adapter.extendForeignObjectAsync(id, {
+                native: { webauthn: cached },
+            });
+        }
+    });
+
+    /**
+     * Get the effective expected origins for verification.
+     * If expectedOrigins is configured, use it. Otherwise, derive from the request's
+     * Origin or Referer header. This allows WebAuthn to work without explicit origin config.
+     */
+    function getExpectedOrigins(req: Request): string | string[] {
+        if (expectedOrigins && (Array.isArray(expectedOrigins) ? expectedOrigins.length > 0 : expectedOrigins)) {
+            return expectedOrigins;
+        }
+        // Derive from request
+        const origin = req.headers.origin;
+        if (origin) {
+            return origin;
+        }
+        const referer = req.headers.referer;
+        if (referer) {
+            try {
+                const url = new URL(referer);
+                return url.origin;
+            } catch {
+                // ignore
+            }
+        }
+        // Fallback: construct from Host header
+        const host = req.headers.host;
+        if (host) {
+            const proto = (req as any).secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+            return `${proto}://${host}`;
+        }
+        return [];
+    }
 
     // ---- Registration ----
 
     /** POST /webauthn/register/options - Generate registration options (requires auth) */
-    app.post('/webauthn/register/options', async (req: Request, res: Response): Promise<void> => {
+    app.post('/login/webauthn/register/options', async (req: Request, res: Response): Promise<void> => {
         try {
-            const userId = getAuthenticatedUser(req);
+            const userId = await getAuthenticatedUser(req, model);
             if (!userId) {
                 res.status(401).json({ error: 'Authentication required' });
                 return;
@@ -141,7 +260,7 @@ export function setupWebAuthnRoutes(
 
             const regOptions = await generateRegistrationOptions({
                 rpName,
-                rpID: rpId,
+                rpID: getRpId(req),
                 userName: userId,
                 excludeCredentials: existingCredentials.map(c => ({
                     id: c.credentialId,
@@ -169,9 +288,9 @@ export function setupWebAuthnRoutes(
     });
 
     /** POST /webauthn/register/verify - Verify registration (requires auth) */
-    app.post('/webauthn/register/verify', async (req: Request, res: Response): Promise<void> => {
+    app.post('/login/webauthn/register/verify', async (req: Request, res: Response): Promise<void> => {
         try {
-            const userId = getAuthenticatedUser(req);
+            const userId = await getAuthenticatedUser(req, model);
             if (!userId) {
                 res.status(401).json({ error: 'Authentication required' });
                 return;
@@ -192,8 +311,9 @@ export function setupWebAuthnRoutes(
             const verification = await verifyRegistrationResponse({
                 response: credential,
                 expectedChallenge: session.challenge,
-                expectedOrigin: expectedOrigins,
-                expectedRPID: rpId,
+                expectedOrigin: getExpectedOrigins(req),
+                expectedRPID: getRpId(req),
+                requireUserVerification: false,  // Allow authenticators that don't support UV
             });
 
             if (!verification.verified || !verification.registrationInfo) {
@@ -226,7 +346,7 @@ export function setupWebAuthnRoutes(
     // ---- Authentication ----
 
     /** POST /webauthn/login/options - Generate authentication options (no auth required) */
-    app.post('/webauthn/login/options', async (req: Request, res: Response): Promise<void> => {
+    app.post('/login/webauthn/login/options', async (req: Request, res: Response): Promise<void> => {
         try {
             const { username } = req.body as { username?: string };
 
@@ -242,13 +362,33 @@ export function setupWebAuthnRoutes(
                 }
                 allowCredentials = credentials.map(c => ({
                     id: c.credentialId,
-                    transports: c.transports,
+                    transports: c.transports?.length ? c.transports : undefined,
                 }));
+            } else {
+                // No username: collect credentials from ALL users for non-discoverable authenticators
+                const allUsers = await adapter.getObjectViewAsync('system', 'user', {
+                    startkey: 'system.user.',
+                    endkey: 'system.user.\u9999',
+                });
+                const allCreds: { id: Base64URLString; transports?: AuthenticatorTransportFuture[] }[] = [];
+                for (const row of allUsers?.rows || []) {
+                    const userId = row.id.replace('system.user.', '');
+                    const creds = await getUserCredentials(adapter, userId);
+                    for (const c of creds) {
+                        allCreds.push({
+                            id: c.credentialId,
+                            transports: c.transports?.length ? c.transports : undefined,
+                        });
+                    }
+                }
+                if (allCreds.length > 0) {
+                    allowCredentials = allCreds;
+                }
             }
-            // If no username, use discoverable credentials (allowCredentials undefined)
 
+            console.log(`[WEBAUTHN-DEBUG] login/options: allowCredentials=${JSON.stringify(allowCredentials)}`);
             const authOptions = await generateAuthenticationOptions({
-                rpID: rpId,
+                rpID: getRpId(req),
                 allowCredentials,
                 userVerification: 'preferred',
             });
@@ -269,15 +409,18 @@ export function setupWebAuthnRoutes(
     });
 
     /** POST /webauthn/login/verify - Verify authentication and issue token */
-    app.post('/webauthn/login/verify', async (req: Request, res: Response): Promise<void> => {
+    app.post('/login/webauthn/login/verify', async (req: Request, res: Response): Promise<void> => {
         try {
             const { challengeId, credential } = req.body as {
                 challengeId: string;
                 credential: AuthenticationResponseJSON;
             };
 
+            console.log(`[WEBAUTHN-DEBUG] login/verify: challengeId=${challengeId}, credentialId=${credential?.id}`);
+
             const session = await getChallenge(adapter, challengeId);
             if (!session || session.type !== 'login') {
+                console.log(`[WEBAUTHN-DEBUG] login/verify: invalid challenge, session=${JSON.stringify(session)}`);
                 res.status(400).json({ error: 'Invalid or expired challenge' });
                 return;
             }
@@ -289,6 +432,8 @@ export function setupWebAuthnRoutes(
                 session.userId,
             );
 
+            console.log(`[WEBAUTHN-DEBUG] login/verify: found userId=${userId}, hasStoredCred=${!!storedCred}`);
+
             if (!userId || !storedCred) {
                 res.status(400).json({ error: 'Unknown credential' });
                 return;
@@ -297,8 +442,9 @@ export function setupWebAuthnRoutes(
             const verification = await verifyAuthenticationResponse({
                 response: credential,
                 expectedChallenge: session.challenge,
-                expectedOrigin: expectedOrigins,
-                expectedRPID: rpId,
+                expectedOrigin: getExpectedOrigins(req),
+                expectedRPID: getRpId(req),
+                requireUserVerification: false,
                 credential: {
                     id: storedCred.credentialId,
                     publicKey: new Uint8Array(Buffer.from(storedCred.publicKey, 'base64')),
@@ -342,7 +488,7 @@ export function setupWebAuthnRoutes(
     // ---- 2FA ----
 
     /** POST /webauthn/2fa/verify - Verify 2FA challenge after password login */
-    app.post('/webauthn/2fa/verify', async (req: Request, res: Response): Promise<void> => {
+    app.post('/login/webauthn/2fa/verify', async (req: Request, res: Response): Promise<void> => {
         try {
             const { challengeId, credential } = req.body as {
                 challengeId: string;
@@ -366,8 +512,9 @@ export function setupWebAuthnRoutes(
             const verification = await verifyAuthenticationResponse({
                 response: credential,
                 expectedChallenge: session.challenge,
-                expectedOrigin: expectedOrigins,
-                expectedRPID: rpId,
+                expectedOrigin: getExpectedOrigins(req),
+                expectedRPID: getRpId(req),
+                requireUserVerification: false,
                 credential: {
                     id: storedCred.credentialId,
                     publicKey: new Uint8Array(Buffer.from(storedCred.publicKey, 'base64')),
@@ -407,9 +554,9 @@ export function setupWebAuthnRoutes(
     // ---- Credential Management ----
 
     /** GET /webauthn/credentials - List user's credentials (without publicKey) */
-    app.get('/webauthn/credentials', async (req: Request, res: Response): Promise<void> => {
+    app.get('/login/webauthn/credentials', async (req: Request, res: Response): Promise<void> => {
         try {
-            const userId = getAuthenticatedUser(req);
+            const userId = await getAuthenticatedUser(req, model);
             if (!userId) {
                 res.status(401).json({ error: 'Authentication required' });
                 return;
@@ -432,9 +579,9 @@ export function setupWebAuthnRoutes(
     });
 
     /** DELETE /webauthn/credentials/:credentialId - Remove a credential */
-    app.delete('/webauthn/credentials/:credentialId', async (req: Request, res: Response): Promise<void> => {
+    app.delete('/login/webauthn/credentials/:credentialId', async (req: Request, res: Response): Promise<void> => {
         try {
-            const userId = getAuthenticatedUser(req);
+            const userId = await getAuthenticatedUser(req, model);
             if (!userId) {
                 res.status(401).json({ error: 'Authentication required' });
                 return;
@@ -511,7 +658,7 @@ async function findCredentialByIdAcrossUsers(
 export async function generate2FAChallenge(
     adapter: ioBroker.Adapter,
     userId: string,
-    rpId: string,
+    rpId: string, // passed by caller — already resolved from request
 ): Promise<{ challengeId: string; options: any } | null> {
     const credentials = await getUserCredentials(adapter, userId);
     if (credentials.length === 0) {
