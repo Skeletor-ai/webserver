@@ -5,6 +5,7 @@ import { JwksClient } from 'jwks-rsa';
 
 import { type InternalStorageToken, OAuth2Model } from './oauth2-model';
 import { oauthTokenToResponse } from './utils';
+import { setupWebAuthnRoutes, generate2FAChallenge, is2FAEnabled, type WebAuthnOptions } from './webauthn';
 
 export interface CookieOptions {
     /** Convenient option for setting the expiry time relative to the current time in **milliseconds**. */
@@ -123,6 +124,12 @@ export function createOAuth2Server(
         refreshLifetime?: number;
         noBasicAuth?: boolean;
         loginPage?: string | ((req: Request) => string);
+        /** WebAuthn Relying Party ID (domain name). If set, WebAuthn endpoints are enabled. */
+        rpId?: string;
+        /** WebAuthn Relying Party display name */
+        rpName?: string;
+        /** Expected origin(s) for WebAuthn, e.g. "https://iobroker.local:8081" */
+        expectedOrigins?: string | string[];
     },
 ): OAuth2Model {
     const model = new OAuth2Model(adapter, {
@@ -281,6 +288,16 @@ export function createOAuth2Server(
         res.redirect(redirectUrl.toString());
     });
 
+    // Setup WebAuthn routes if configured
+    if (options.rpId) {
+        const webauthnOptions: WebAuthnOptions = {
+            rpId: options.rpId,
+            rpName: options.rpName || 'ioBroker',
+            expectedOrigins: options.expectedOrigins || [],
+        };
+        setupWebAuthnRoutes(options.app, adapter, model, webauthnOptions);
+    }
+
     // Post token.
     options.app.post('/oauth/token', (req: Request, res: Response) => {
         const request = new OAuthRequest(req);
@@ -288,7 +305,35 @@ export function createOAuth2Server(
         const response = new OAuthResponse(res);
         oauth
             .token(request, response)
-            .then((token: Token): void => {
+            .then(async (token: Token): Promise<void> => {
+                // Check if 2FA is required for this user
+                if (options.rpId && token.user?.id) {
+                    try {
+                        const has2FA = await is2FAEnabled(adapter, token.user.id);
+                        if (has2FA) {
+                            // Revoke the just-created tokens — user must complete 2FA first
+                            void adapter.destroySession(`a:${token.accessToken}`);
+                            if (token.refreshToken) {
+                                void adapter.destroySession(`r:${token.refreshToken}`);
+                            }
+
+                            const challenge = await generate2FAChallenge(adapter, token.user.id, options.rpId);
+                            if (challenge) {
+                                res.json({
+                                    requires2FA: true,
+                                    challengeId: challenge.challengeId,
+                                    options: challenge.options,
+                                });
+                                return;
+                            }
+                            // If no credentials found despite 2FA flag, fall through to normal flow
+                        }
+                    } catch (e) {
+                        adapter.log.warn(`2FA check failed for ${token.user.id}: ${(e as Error).message}`);
+                        // Fall through to normal flow
+                    }
+                }
+
                 // save access token and refresh token in cookies with expiration time and flags HTTPOnly, Secure.
                 const cookieOptions: CookieOptions = {
                     httpOnly: true, // Makes the cookie inaccessible to client-side JavaScript

@@ -37,6 +37,7 @@
   "main": "build/index.js",
   "types": "build/index.d.ts",
   "dependencies": {
+    "@simplewebauthn/server": "^13.2.2",
     "jsonwebtoken": "^9.0.3",
     "jwks-rsa": "^3.2.2",
     "oauth2-server": "^3.1.1"
@@ -55,6 +56,9 @@
     "@types/express": "^5.0.6",
     "@types/node": "^25.2.3",
     "@types/oauth2-server": "^3.0.18",
+    "chai": "^4.5.0",
+    "express": "^5.2.1",
+    "mocha": "^11.6.0",
     "typescript": "~5.9.3"
   }
 }
