@@ -606,6 +606,55 @@ export function setupWebAuthnRoutes(
         }
     });
 
+    /** GET /webauthn/2fa - Get 2FA status for the authenticated user */
+    app.get('/login/webauthn/2fa', async (req: Request, res: Response): Promise<void> => {
+        try {
+            const userId = await getAuthenticatedUser(req, model);
+            if (!userId) {
+                res.status(401).json({ error: 'Authentication required' });
+                return;
+            }
+            const userObj = await adapter.getForeignObjectAsync(`system.user.${userId}`);
+            const enabled = !!(userObj?.common as any)?.webauthn2FA;
+            const credentials = await getUserCredentials(adapter, userId);
+            res.json({ enabled, hasCredentials: credentials.length > 0 });
+        } catch (e) {
+            adapter.log.error(`WebAuthn 2FA status error: ${(e as Error).message}`);
+            res.status(500).json({ error: 'Internal error' });
+        }
+    });
+
+    /** PUT /webauthn/2fa - Enable or disable 2FA for the authenticated user */
+    app.put('/login/webauthn/2fa', async (req: Request, res: Response): Promise<void> => {
+        try {
+            const userId = await getAuthenticatedUser(req, model);
+            if (!userId) {
+                res.status(401).json({ error: 'Authentication required' });
+                return;
+            }
+            const { enabled } = req.body as { enabled: boolean };
+            if (typeof enabled !== 'boolean') {
+                res.status(400).json({ error: 'enabled must be boolean' });
+                return;
+            }
+            // Cannot enable 2FA without a registered passkey
+            if (enabled) {
+                const credentials = await getUserCredentials(adapter, userId);
+                if (credentials.length === 0) {
+                    res.status(400).json({ error: 'No passkeys registered — register a passkey first' });
+                    return;
+                }
+            }
+            await adapter.extendForeignObjectAsync(`system.user.${userId}`, {
+                common: { webauthn2FA: enabled } as any,
+            });
+            res.json({ success: true, enabled });
+        } catch (e) {
+            adapter.log.error(`WebAuthn 2FA toggle error: ${(e as Error).message}`);
+            res.status(500).json({ error: 'Internal error' });
+        }
+    });
+
     /** DELETE /webauthn/credentials/:credentialId - Remove a credential */
     app.delete('/login/webauthn/credentials/:credentialId', async (req: Request, res: Response): Promise<void> => {
         try {
