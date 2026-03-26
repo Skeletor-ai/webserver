@@ -182,12 +182,40 @@ export function setupWebAuthnRoutes(
 ): void {
     const { rpId: configuredRpId, rpName, expectedOrigins } = options;
 
+    /** Check if a string is an IP address (v4 or v6) */
+    function isIpAddress(host: string): boolean {
+        // IPv4
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return true;
+        // IPv6
+        if (host.startsWith('[') || host.includes(':')) return true;
+        return false;
+    }
+
     /** Get the effective rpId - derive from request Host header for maximum compatibility */
     function getRpId(req?: Request): string {
         if (req) {
-            const host = req.hostname || req.headers.host?.split(':')[0];
-            if (host && host !== '127.0.0.1') {
-                return host;
+            // 1. Origin header (most reliable — browser always sends the real origin)
+            const origin = req.headers.origin;
+            if (origin) {
+                try {
+                    const url = new URL(origin);
+                    const hostname = url.hostname;
+                    if (hostname && !isIpAddress(hostname) && hostname !== 'localhost') {
+                        return hostname;
+                    }
+                } catch {
+                    // ignore
+                }
+            }
+            // 2. X-Forwarded-Host (set by reverse proxies like LAN Cert Manager)
+            const forwardedHost = (req.headers['x-forwarded-host'] as string)?.split(',')[0]?.trim()?.split(':')[0];
+            if (forwardedHost && !isIpAddress(forwardedHost) && forwardedHost !== 'localhost') {
+                return forwardedHost;
+            }
+            // 3. Raw Host header
+            const rawHost = req.headers.host?.split(':')[0];
+            if (rawHost && !isIpAddress(rawHost) && rawHost !== 'localhost') {
+                return rawHost;
             }
         }
         return configuredRpId || 'localhost';
