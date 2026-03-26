@@ -298,7 +298,7 @@ export function setupWebAuthnRoutes(
                 })),
                 authenticatorSelection: {
                     residentKey: 'preferred',
-                    userVerification: 'preferred',
+                    userVerification: 'required',
                 },
             });
 
@@ -343,7 +343,7 @@ export function setupWebAuthnRoutes(
                 expectedChallenge: session.challenge,
                 expectedOrigin: getExpectedOrigins(req),
                 expectedRPID: getRpId(req),
-                requireUserVerification: false,  // Allow authenticators that don't support UV
+                requireUserVerification: true,  // Require biometric/PIN verification, not just presence
             });
 
             if (!verification.verified || !verification.registrationInfo) {
@@ -420,7 +420,7 @@ export function setupWebAuthnRoutes(
             const authOptions = await generateAuthenticationOptions({
                 rpID: getRpId(req),
                 allowCredentials,
-                userVerification: 'preferred',
+                userVerification: 'required',
             });
 
             const challengeId = randomBytes(32).toString('hex');
@@ -474,7 +474,7 @@ export function setupWebAuthnRoutes(
                 expectedChallenge: session.challenge,
                 expectedOrigin: getExpectedOrigins(req),
                 expectedRPID: getRpId(req),
-                requireUserVerification: false,
+                requireUserVerification: true,
                 credential: {
                     id: storedCred.credentialId,
                     publicKey: new Uint8Array(Buffer.from(storedCred.publicKey, 'base64')),
@@ -544,7 +544,7 @@ export function setupWebAuthnRoutes(
                 expectedChallenge: session.challenge,
                 expectedOrigin: getExpectedOrigins(req),
                 expectedRPID: getRpId(req),
-                requireUserVerification: false,
+                requireUserVerification: true,
                 credential: {
                     id: storedCred.credentialId,
                     publicKey: new Uint8Array(Buffer.from(storedCred.publicKey, 'base64')),
