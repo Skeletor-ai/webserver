@@ -52,8 +52,6 @@ const CHALLENGE_TTL = 300; // 5 minutes
  * authorize middleware in the admin adapter.
  */
 async function getAuthenticatedUser(req: Request, model?: OAuth2Model): Promise<string | undefined> {
-    console.log(`[WEBAUTHN-DEBUG] getAuthenticatedUser called, hasModel=${!!model}, reqUser=${(req as any).user}`);
-
     const _req = req as Request & { user?: string };
     if (_req.user) {
         return _req.user;
@@ -63,12 +61,16 @@ async function getAuthenticatedUser(req: Request, model?: OAuth2Model): Promise<
         return undefined;
     }
 
-    // Try access_token cookie
+    // Try access_token cookie — support both plain and URL-encoded values
     if (req.headers.cookie) {
-        const cookies = req.headers.cookie.split(';').map(c => c.trim().split('='));
+        const cookies = req.headers.cookie.split(';').map(c => {
+            const idx = c.indexOf('=');
+            return idx > -1 ? [c.slice(0, idx).trim(), c.slice(idx + 1).trim()] : [c.trim(), ''];
+        });
         const tokenCookie = cookies.find(c => c[0] === 'access_token');
         if (tokenCookie?.[1]) {
-            const token = await model.getAccessToken(tokenCookie[1]);
+            const tokenValue = decodeURIComponent(tokenCookie[1]);
+            const token = await model.getAccessToken(tokenValue);
             if (token) {
                 return token.user.id;
             }
