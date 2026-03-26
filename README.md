@@ -129,6 +129,96 @@ Data: grant_type=refresh_token&refresh_token=<REFRESH_TOKEN>&client_id=ioBroker&
 
 The answer is the same as for the login but with new tokens.
 
+## WebAuthn / Passkey support
+
+The webserver supports WebAuthn (Passkeys, fingerprint readers, security keys) as an authentication method, either as a standalone login or as a second factor (2FA) after password login.
+
+### Prerequisites
+
+- ioBroker Admin must be served over **HTTPS** from a **real hostname** (not an IP address). WebAuthn is a browser security feature and requires a valid origin.
+- If you use a **reverse proxy** (e.g. nginx, Traefik, LAN Cert Manager), it must forward the original `Origin` header for `/webauthn/` paths and set `X-Forwarded-Host`.
+
+### Enable WebAuthn
+
+Pass the `rpId` and `rpName` options to `createOAuth2Server`:
+
+```typescript
+createOAuth2Server(this, {
+    app: this.webServer.app,
+    secure: this.config.secure,
+    rpId: this.config.webauthnRpId || undefined,     // e.g. "iobroker.home"
+    rpName: this.config.webauthnRpName || 'ioBroker',
+    expectedOrigins: this.config.webauthnExpectedOrigins || undefined, // optional allowlist
+});
+```
+
+If `rpId` is not set, it is **automatically derived from the request's `Origin` or `X-Forwarded-Host` header** — this works correctly with reverse proxies as long as they pass the original headers.
+
+### API endpoints
+
+All endpoints are mounted under `/login/webauthn/`.
+
+#### Passkey registration (requires authenticated session)
+
+```http
+POST /login/webauthn/register/options
+POST /login/webauthn/register/verify
+```
+
+#### Passkey login
+
+```http
+POST /login/webauthn/login/options
+POST /login/webauthn/login/verify
+```
+
+On success, `/login/webauthn/login/verify` returns an OAuth2 token identical to the `/oauth/token` response.
+
+#### 2FA (after password login)
+
+If `webauthn2FA: true` is set on a user object, the `/oauth/token` endpoint returns a challenge instead of a token:
+
+```json
+{
+    "requires2FA": true,
+    "challengeId": "...",
+    "options": { ... }
+}
+```
+
+The client must then call:
+
+```http
+POST /login/webauthn/2fa/verify
+```
+
+with the assertion response to receive the final OAuth2 token.
+
+#### Credential management (requires authenticated session)
+
+```http
+GET    /login/webauthn/credentials
+DELETE /login/webauthn/credentials/:credentialId
+```
+
+### Credential storage
+
+Credentials are stored in the ioBroker objects DB under `system.user.<name>.native.webauthn` as an array. The 2FA flag is stored in `system.user.<name>.common.webauthn2FA`.
+
+### Reverse proxy configuration
+
+When running behind a reverse proxy, the proxy must **not rewrite the `Origin` header** for WebAuthn paths. Example for nginx:
+
+```nginx
+location /login/webauthn/ {
+    proxy_pass http://iobroker-host:8081;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # Do NOT rewrite Origin here
+}
+```
+
 ## Changelog
 
 <!--
